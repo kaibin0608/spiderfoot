@@ -16,10 +16,18 @@ import logging
 import multiprocessing as mp
 import random
 import string
+import threading
 import time
+import uuid
 from copy import deepcopy
 from io import BytesIO, StringIO
 from operator import itemgetter
+
+from spiderfoot.robin_osint.llm_utils import get_model_choices
+from spiderfoot.robin_osint.llm import get_llm, refine_query, filter_results, generate_summary
+from spiderfoot.robin_osint.search import get_search_results
+from spiderfoot.robin_osint.scrape import scrape_multiple
+from spiderfoot.robin_osint.health import check_tor_proxy, check_search_engines
 
 import cherrypy
 from cherrypy import _cperror
@@ -120,6 +128,9 @@ class SpiderFootWebUi:
             "tools.response_headers.on": True,
             "tools.response_headers.headers": secure_headers.framework.cherrypy()
         })
+
+        self._robin_jobs = {}
+        self._robin_jobs_lock = threading.Lock()
 
     def error_page(self: 'SpiderFootWebUi') -> None:
         """Error page."""
@@ -1882,3 +1893,99 @@ class SpiderFootWebUi:
         retdata['data'] = datamap
 
         return retdata
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def robin_models(self: 'SpiderFootWebUi') -> dict:
+        """List available LLM models based on configured API keys.
+
+        Returns:
+            dict: {"models": [...]}
+        """
+        try:
+            return {"models": get_model_choices()}
+        except Exception as e:
+            return self.jsonify_error('500', str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def robin_health(self: 'SpiderFootWebUi') -> dict:
+        """Check Tor proxy status and reachability of all dark web search engines.
+
+        Returns:
+            dict: {"tor": {...}, "engines": [...]}
+        """
+        try:
+            return {
+                "tor": check_tor_proxy(),
+                "engines": check_search_engines()
+            }
+        except Exception as e:
+            return self.jsonify_error('500', str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def robin_investigate(self: 'SpiderFootWebUi', query: str = None, model: str = None,
+                          preset: str = "threat_intel", custom: str = "") -> dict:
+        """Start an async dark web OSINT investigation using Robin's pipeline.
+
+        Args:
+            query (str): investigation query
+            model (str): LLM model name (from /robin_models)
+            preset (str): analyst prompt preset — threat_intel | ransomware_malware | personal_identity | corporate_espionage
+            custom (str): additional analyst instructions
+
+        Returns:
+            dict: {"job_id": "...", "status": "running"} or error
+        """
+        if not query or not model:
+            cherrypy.response.status = 400
+            return {"error": "query and model are required"}
+
+        job_id = uuid.uuid4().hex[:8]
+        with self._robin_jobs_lock:
+            self._robin_jobs[job_id] = {"status": "running"}
+
+        def _run():
+            try:
+                llm = get_llm(model)
+                refined = refine_query(llm, query)
+                raw_results = get_search_results(refined)
+                top_results = filter_results(llm, refined, raw_results)
+                scraped = scrape_multiple(top_results)
+                content = "\n\n".join(f"{url}\n{text}" for url, text in scraped.items())
+                report = generate_summary(llm, query, content, preset, custom)
+                with self._robin_jobs_lock:
+                    self._robin_jobs[job_id] = {"status": "done", "result": report}
+            except Exception as e:
+                with self._robin_jobs_lock:
+                    self._robin_jobs[job_id] = {"status": "error", "error": str(e)}
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        return {"job_id": job_id, "status": "running"}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def robin_status(self: 'SpiderFootWebUi', job_id: str = None) -> dict:
+        """Poll the status and result of a robin_investigate job.
+
+        Args:
+            job_id (str): job ID returned by /robin_investigate
+
+        Returns:
+            dict: job status and result/error
+        """
+        if not job_id:
+            cherrypy.response.status = 400
+            return {"error": "job_id is required"}
+
+        with self._robin_jobs_lock:
+            job = self._robin_jobs.get(job_id)
+
+        if job is None:
+            cherrypy.response.status = 404
+            return {"error": "Job not found"}
+
+        return {"job_id": job_id, **job}
