@@ -173,3 +173,6 @@ cover/
 # Documentation #
 #################
 docs/_build/
+
+.venv
+.env
