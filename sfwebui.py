@@ -1925,6 +1925,19 @@ class SpiderFootWebUi:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def robin_tor_status(self: 'SpiderFootWebUi') -> dict:
+        """Lightweight Tor-only health check — no engine ping.
+
+        Returns:
+            dict: {"tor": {...}}
+        """
+        try:
+            return {"tor": check_tor_proxy()}
+        except Exception as e:
+            return self.jsonify_error('500', str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def robin_investigate(self: 'SpiderFootWebUi', query: str = None, model: str = None,
                           preset: str = "threat_intel", custom: str = "") -> dict:
         """Start an async dark web OSINT investigation using Robin's pipeline.
@@ -1947,14 +1960,33 @@ class SpiderFootWebUi:
             self._robin_jobs[job_id] = {"status": "running"}
 
         def _run():
+            def set_stage(stage, log=None):
+                with self._robin_jobs_lock:
+                    self._robin_jobs[job_id]["stage"] = stage
+                    if log:
+                        self._robin_jobs[job_id]["logs"].append(log)
+
             try:
+                with self._robin_jobs_lock:
+                    self._robin_jobs[job_id]["logs"] = []
+
+                set_stage("refining query (1/5)")
                 llm = get_llm(model)
                 refined = refine_query(llm, query)
+
+                set_stage("searching dark web (2/5)", f"Refined query: '{refined}'")
                 raw_results = get_search_results(refined)
+
+                set_stage("filtering results (3/5)", f"Found {len(raw_results)} unique results across engines")
                 top_results = filter_results(llm, refined, raw_results)
+
+                set_stage("scraping content (4/5)", f"Filtered to {len(top_results)}/{len(raw_results)} relevant results")
                 scraped = scrape_multiple(top_results)
                 content = "\n\n".join(f"{url}\n{text}" for url, text in scraped.items())
+
+                set_stage("generating report (5/5)", f"Scraped {len(scraped)}/{len(top_results)} pages successfully")
                 report = generate_summary(llm, query, content, preset, custom)
+
                 with self._robin_jobs_lock:
                     self._robin_jobs[job_id] = {"status": "done", "result": report}
             except Exception as e:
