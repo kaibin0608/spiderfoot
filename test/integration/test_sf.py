@@ -134,8 +134,8 @@ class TestSf(unittest.TestCase):
 
         expected_output = [
             "Source,Type,Data",
-            "SpiderFoot UI,Internet Name,spiderfoot.net,spiderfoot.net\n",
-            "SpiderFoot UI,Domain Name,spiderfoot.net,spiderfoot.net\n",
+            "Pulse,Internet Name,spiderfoot.net,spiderfoot.net\n",
+            "Pulse,Domain Name,spiderfoot.net,spiderfoot.net\n",
             "sfp_countryname,Country Name,spiderfoot.net,United States\n",
         ]
         for output in expected_output:
